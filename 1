@@ -531,17 +531,29 @@ function parseTracks(html) {
 async function getTracks(ext) {
     ext = argsify(ext)
 
-    const id = ext.id || ''
+    const id = String(ext.id || '').trim()
 
-    if (!id) return jsonify({ list: [] })
+    if (!id) {
+        return jsonify({ list: [] })
+    }
 
     try {
-        const html = await fetchHtml(
-            SITE + '/detail/' + id + '/',
-            SITE + '/'
-        )
+        // 当前黄果视频页面使用 /video/ID/
+        const url = SITE + '/video/' + id + '/'
+
+        const html = await fetchHtml(url, SITE + '/')
+
+        if (!html) {
+            console.error('getTracks: video page is empty')
+            return jsonify({ list: [] })
+        }
 
         const tracks = parseTracks(html)
+
+        console.error(
+            'getTracks: tracks count =',
+            tracks.length
+        )
 
         if (!tracks.length) {
             return jsonify({ list: [] })
@@ -675,18 +687,46 @@ function findPlayUrl(data, ep) {
 async function getPlayinfo(ext) {
     ext = argsify(ext)
 
-    const url = ext.url || ''
+    const url = String(ext.url || '').trim()
     const ep = String(ext.ep || '1')
 
-    if (!url) return jsonify({ urls: [] })
+    if (!url) {
+        console.error('getPlayinfo: url is empty')
+        return jsonify({ urls: [] })
+    }
 
     try {
+        console.error('getPlayinfo: request url =', url)
+
+        // 如果上游已经直接传入 m3u8，直接返回
+        if (/\.m3u8(?:\?|$)/i.test(url)) {
+            return jsonify({
+                urls: [url],
+                headers: [
+                    {
+                        'User-Agent': UA,
+                        'Referer': SITE + '/',
+                    },
+                ],
+            })
+        }
+
         const html = await fetchHtml(url, SITE + '/')
 
+        console.error(
+            'getPlayinfo: html length =',
+            html ? html.length : 0
+        )
+
+        if (!html) {
+            return jsonify({ urls: [] })
+        }
+
         const data = findVideoJson(html)
+
         let play = findPlayUrl(data, ep)
 
-        // 兜底：直接从页面中查找 m3u8
+        // 兜底：从 HTML 中直接搜索 m3u8
         if (!play) {
             const m3u8M = html.match(
                 /https?:\/\/[^"'\\\s<>]+\.m3u8(?:\?[^"'\\\s<>]*)?/i
@@ -698,9 +738,16 @@ async function getPlayinfo(ext) {
         }
 
         if (!play) {
-            console.error('getPlayinfo: play url not found')
+            console.error(
+                'getPlayinfo: play url not found'
+            )
             return jsonify({ urls: [] })
         }
+
+        console.error(
+            'getPlayinfo: play url =',
+            play
+        )
 
         return jsonify({
             urls: [play],
@@ -716,7 +763,6 @@ async function getPlayinfo(ext) {
         return jsonify({ urls: [] })
     }
 }
-
 // ============================================================
 // 搜索
 // ============================================================
