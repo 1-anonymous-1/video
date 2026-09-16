@@ -1,0 +1,758 @@
+// 黄果短剧 huangguoai.com
+// XPTV 扩展增强版
+// 保留原接口，增强 HTML 属性、卡片、剧集、播放 JSON 解析兼容性
+
+const UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+const SITE = 'https://huangguoai.com'
+
+const HEADERS = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': SITE + '/',
+}
+
+const TABS = [
+    { name: '首页', id: 'home' },
+    { name: 'AI成人短剧', id: 'ai-duanju' },
+    { name: 'AI成人漫剧', id: 'ai-manju' },
+    { name: 'AI换脸', id: 'ai-huanlian' },
+    { name: 'AI魔改', id: 'ai-mogai' },
+    { name: '排行榜', id: 'ranks/hot' },
+]
+
+// ============================================================
+// 工具函数
+// ============================================================
+
+function fix(u) {
+    if (!u) return ''
+
+    u = String(u).trim()
+
+    // HTML 实体
+    u = u
+        .replace(/&amp;/gi, '&')
+        .replace(/&#x2F;/gi, '/')
+        .replace(/&#47;/gi, '/')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+
+    if (u.indexOf('//') === 0) return 'https:' + u
+    if (u.indexOf('/') === 0) return SITE + u
+
+    return u
+}
+
+function imgSrc(u) {
+    // 不再强制删除查询参数。
+    // 某些 CDN 图片需要 auth_key 等参数才能访问。
+    return fix(u || '')
+}
+
+function stripTags(s) {
+    return String(s || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/\s+/g, ' ')
+        .trim()
+}
+
+function attr(html, name) {
+    if (!html) return ''
+
+    // 兼容单双引号、属性前后空格
+    const re = new RegExp(
+        name + '\\s*=\\s*([\'"])(.*?)\\1',
+        'i'
+    )
+
+    const m = html.match(re)
+    return m ? m[2].trim() : ''
+}
+
+function classHas(html, className) {
+    const cls = attr(html, 'class')
+    return new RegExp('(^|\\s)' + className + '(\\s|$)', 'i').test(cls)
+}
+
+function decodeText(s) {
+    return String(s || '')
+        .replace(/\\u0026/g, '&')
+        .replace(/\\u002F/g, '/')
+        .replace(/\\u003A/g, ':')
+        .replace(/\\u003F/g, '?')
+        .replace(/\\u003D/g, '=')
+        .replace(/\\u0022/g, '"')
+        .replace(/\\u0027/g, "'")
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .trim()
+}
+
+async function fetchHtml(url, referer) {
+    const headers = Object.assign({}, HEADERS)
+
+    if (referer) {
+        headers.Referer = referer
+    }
+
+    const resp = await $fetch.get(url, { headers })
+    const data = resp && resp.data
+
+    if (typeof data === 'string') return data
+    if (data == null) return ''
+
+    return JSON.stringify(data)
+}
+
+// ============================================================
+// HTML 区块提取
+// ============================================================
+
+// 根据 class 找到开始标签
+function findClassStarts(html, className) {
+    const re = new RegExp(
+        '<([a-z0-9]+)\\b[^>]*\\bclass\\s*=\\s*([\'"])[^\\2]*\\b' +
+        className +
+        '\\b[^\\2]*\\2[^>]*>',
+        'gi'
+    )
+
+    const result = []
+    let m
+
+    while ((m = re.exec(html)) !== null) {
+        result.push({
+            index: m.index,
+            end: re.lastIndex,
+            tag: m[1].toLowerCase(),
+        })
+    }
+
+    return result
+}
+
+// 简单提取同级区块，兼容嵌套标签
+function extractBlock(html, startIndex, startEnd, tagName) {
+    const openRe = new RegExp('<' + tagName + '\\b[^>]*>', 'gi')
+    const closeRe = new RegExp('</' + tagName + '\\s*>', 'gi')
+
+    openRe.lastIndex = startIndex
+    closeRe.lastIndex = startEnd
+
+    let depth = 1
+    let pos = startEnd
+
+    while (depth > 0) {
+        const om = openRe.exec(html)
+        const cm = closeRe.exec(html)
+
+        if (!cm) return html.slice(startEnd)
+
+        if (om && om.index < cm.index) {
+            depth++
+            pos = openRe.lastIndex
+        } else {
+            depth--
+            pos = closeRe.lastIndex
+        }
+    }
+
+    return html.slice(startEnd, pos - ('</' + tagName + '>').length)
+}
+
+function getBlocksByClass(html, className) {
+    const starts = findClassStarts(html, className)
+    const blocks = []
+
+    for (const item of starts) {
+        // 主要处理 div 区块
+        const block = extractBlock(
+            html,
+            item.index,
+            item.end,
+            item.tag
+        )
+
+        blocks.push(block)
+    }
+
+    return blocks
+}
+
+// ============================================================
+// 卡片解析
+// ============================================================
+
+function parseCardBlock(block) {
+    if (!block) return null
+
+    // 兼容 /detail/123/、/detail/123、带其他参数
+    const linkRe = /href\s*=\s*(['"])([^'"]*\/detail\/(\d+)(?:\/[^'"]*)?)\1/i
+    const linkM = block.match(linkRe)
+
+    if (!linkM) return null
+
+    const vid = linkM[3]
+
+    // 图片兼容 data-src、data-original、src、data-lazy-src
+    const img =
+        attr(block, 'data-src') ||
+        attr(block, 'data-original') ||
+        attr(block, 'data-lazy-src') ||
+        attr(block, 'src') ||
+        ''
+
+    let title = ''
+
+    // 优先匹配常见标题 class
+    const titleRe =
+        /class\s*=\s*(['"])[^'"]*(?:hg-drama-card__title|drama-title|card-title)[^'"]*\1[^>]*>([\s\S]*?)<\/[^>]+>/i
+
+    const titleM = block.match(titleRe)
+
+    if (titleM) {
+        title = stripTags(titleM[2])
+    }
+
+    // 从标题链接中提取
+    if (!title) {
+        const links = block.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || []
+
+        for (const a of links) {
+            const txt = stripTags(a)
+
+            if (txt && txt.length > 1 && !/播放|详情|查看/i.test(txt)) {
+                title = txt
+                break
+            }
+        }
+    }
+
+    // 从 alt/title 兜底
+    if (!title) {
+        title = attr(block, 'title') || attr(block, 'alt')
+    }
+
+    if (!title) return null
+
+    let remarks = ''
+
+    const epM = block.match(
+        /class\s*=\s*(['"])[^'"]*(?:hg-drama-card__episode|episode|card-episode)[^'"]*\1[^>]*>([\s\S]*?)<\/[^>]+>/i
+    )
+
+    const scoreM = block.match(
+        /class\s*=\s*(['"])[^'"]*(?:hg-drama-card__score|score|card-score)[^'"]*\1[^>]*>([\s\S]*?)<\/[^>]+>/i
+    )
+
+    const ep = epM ? stripTags(epM[2]) : ''
+    const score = scoreM ? stripTags(scoreM[2]) : ''
+
+    if (ep && score) remarks = ep + ' · ' + score
+    else remarks = ep || score
+
+    return {
+        vod_id: vid,
+        vod_name: title,
+        vod_pic: imgSrc(img),
+        vod_remarks: remarks,
+        ext: {
+            id: vid,
+        },
+    }
+}
+
+function parseGridCards(html, allGrids) {
+    if (!html) return []
+
+    const list = []
+    const seen = {}
+
+    let gridBlocks = getBlocksByClass(html, 'hg-card-grid')
+
+    // 如果 class 改名，尝试从卡片自身向上无法可靠定位，
+    // 因此直接全局搜索卡片作为兜底。
+    if (!gridBlocks.length) {
+        gridBlocks = [html]
+    } else if (!allGrids) {
+        gridBlocks = [gridBlocks[0]]
+    }
+
+    for (const grid of gridBlocks) {
+        const cards = getBlocksByClass(grid, 'hg-drama-card')
+
+        // 兼容卡片 class 改动时的通用候选
+        const candidates = cards.length
+            ? cards
+            : getBlocksByClass(grid, 'drama-card')
+
+        for (const block of candidates) {
+            try {
+                const item = parseCardBlock(block)
+
+                if (!item || seen[item.vod_id]) continue
+
+                seen[item.vod_id] = true
+                list.push(item)
+            } catch (e) {
+                console.error('parse card error:', e)
+            }
+        }
+    }
+
+    return list
+}
+
+// ============================================================
+// 排行榜解析
+// ============================================================
+
+function parseRanks(html) {
+    if (!html) return []
+
+    const list = []
+    const seen = {}
+
+    let blocks = getBlocksByClass(html, 'hg-rank-item')
+
+    if (!blocks.length) {
+        blocks = getBlocksByClass(html, 'rank-item')
+    }
+
+    for (const block of blocks) {
+        try {
+            const item = parseCardBlock(block)
+
+            if (!item || seen[item.vod_id]) continue
+
+            seen[item.vod_id] = true
+            list.push(item)
+        } catch (e) {
+            console.error('parse rank error:', e)
+        }
+    }
+
+    return list
+}
+
+// ============================================================
+// 接口
+// ============================================================
+
+async function getLocalInfo() {
+    return jsonify({
+        ver: 1,
+        name: '黄果短剧',
+        api: 'csp_huangguo',
+        type: 3,
+    })
+}
+
+async function getConfig() {
+    return jsonify({
+        ver: 1,
+        title: '黄果短剧',
+        site: SITE,
+        tabs: TABS.map((t) => ({
+            name: t.name,
+            ext: {
+                id: t.id,
+            },
+        })),
+    })
+}
+
+async function getCards(ext) {
+    ext = argsify(ext)
+
+    const id = String(ext.id || 'home').replace(/^\//, '')
+    const page = Math.max(1, parseInt(ext.page) || 1)
+
+    try {
+        let url
+
+        if (id === 'home') {
+            url = SITE + '/'
+        } else {
+            url =
+                SITE +
+                '/' +
+                id +
+                '/' +
+                (page > 1 ? page + '/' : '')
+        }
+
+        const html = await fetchHtml(url)
+
+        if (!html) {
+            return jsonify({
+                list: [],
+                page: page,
+            })
+        }
+
+        let list
+
+        if (id.indexOf('rank') !== -1) {
+            list = parseRanks(html)
+        } else {
+            list = parseGridCards(html, id === 'home')
+        }
+
+        return jsonify({
+            list: list,
+            page: page,
+        })
+    } catch (e) {
+        console.error('getCards error:', e)
+
+        return jsonify({
+            list: [],
+            page: page,
+        })
+    }
+}
+
+// ============================================================
+// 剧集解析
+// ============================================================
+
+function parseEpisodeLink(tag) {
+    const href =
+        attr(tag, 'href') ||
+        attr(tag, 'data-url') ||
+        attr(tag, 'data-href') ||
+        ''
+
+    if (!href) return null
+
+    const ep =
+        attr(tag, 'data-ep-id') ||
+        attr(tag, 'data-episode') ||
+        attr(tag, 'data-ep') ||
+        ''
+
+    let name = ''
+
+    if (ep) {
+        name = '第' + ep + '集'
+    } else {
+        name = stripTags(tag)
+    }
+
+    if (!name || name.length > 30) {
+        name = '第' + (parseEpisodeLink.index || 1) + '集'
+    }
+
+    parseEpisodeLink.index = (parseEpisodeLink.index || 0) + 1
+
+    return {
+        name: name,
+        ext: {
+            url: fix(href),
+            ep: String(ep || ''),
+        },
+    }
+}
+
+function parseTracks(html) {
+    const tracks = []
+
+    parseEpisodeLink.index = 1
+
+    // 优先获取剧集容器
+    let containers = getBlocksByClass(html, 'hg-web-detail__ep-grid')
+
+    if (!containers.length) {
+        containers = getBlocksByClass(html, 'ep-grid')
+    }
+
+    const source = containers.length ? containers[0] : html
+
+    // 兼容 a 标签、button、带 data-url 的元素
+    const tags =
+        source.match(/<(?:a|button)\b[^>]*>[\s\S]*?<\/(?:a|button)>/gi) || []
+
+    const seen = {}
+
+    for (const tag of tags) {
+        const track = parseEpisodeLink(tag)
+
+        if (!track || !track.ext.url) continue
+
+        const key = track.ext.url + '|' + track.ext.ep
+
+        if (seen[key]) continue
+
+        seen[key] = true
+        tracks.push(track)
+    }
+
+    // 详情页没有剧集网格时，尝试主播放按钮
+    if (!tracks.length) {
+        const playRe =
+            /<(?:a|button)\b[^>]*(?:class\s*=\s*(['"])[^'"]*\bhg-web-detail__play\b[^'"]*\1|data-url\s*=)[^>]*>/gi
+
+        let m
+
+        while ((m = playRe.exec(html)) !== null) {
+            const tag = m[0]
+            const href =
+                attr(tag, 'href') ||
+                attr(tag, 'data-url') ||
+                attr(tag, 'data-href')
+
+            if (href) {
+                tracks.push({
+                    name: '第1集',
+                    ext: {
+                        url: fix(href),
+                        ep: '1',
+                    },
+                })
+                break
+            }
+        }
+    }
+
+    return tracks
+}
+
+async function getTracks(ext) {
+    ext = argsify(ext)
+
+    const id = ext.id || ''
+
+    if (!id) return jsonify({ list: [] })
+
+    try {
+        const html = await fetchHtml(
+            SITE + '/detail/' + id + '/',
+            SITE + '/'
+        )
+
+        const tracks = parseTracks(html)
+
+        if (!tracks.length) {
+            return jsonify({ list: [] })
+        }
+
+        return jsonify({
+            list: [
+                {
+                    title: '黄果短剧',
+                    tracks: tracks,
+                },
+            ],
+        })
+    } catch (e) {
+        console.error('getTracks error:', e)
+        return jsonify({ list: [] })
+    }
+}
+
+// ============================================================
+// 播放地址解析
+// ============================================================
+
+function findVideoJson(html) {
+    if (!html) return null
+
+    // 兼容 id 双引号、单引号、属性顺序变化
+    const patterns = [
+        /<script\b[^>]*id\s*=\s*(['"])videoInitialData\1[^>]*>([\s\S]*?)<\/script>/i,
+        /<script\b[^>]*id\s*=\s*(['"])videoData\1[^>]*>([\s\S]*?)<\/script>/i,
+        /<script\b[^>]*type\s*=\s*(['"])application\/json\1[^>]*>([\s\S]*?)<\/script>/i,
+    ]
+
+    for (const re of patterns) {
+        const m = html.match(re)
+
+        if (!m) continue
+
+        let raw = m[2]
+            .trim()
+            .replace(/&quot;/gi, '"')
+            .replace(/&amp;/gi, '&')
+
+        try {
+            return JSON.parse(raw)
+        } catch (e) {
+            // 尝试提取 JSON 对象
+            const start = raw.indexOf('{')
+            const end = raw.lastIndexOf('}')
+
+            if (start >= 0 && end > start) {
+                try {
+                    return JSON.parse(raw.slice(start, end + 1))
+                } catch (e2) {}
+            }
+        }
+    }
+
+    return null
+}
+
+function findPlayUrl(data, ep) {
+    if (!data) return ''
+
+    let play = ''
+
+    // 常见结构
+    const srcs =
+        data.epPlaySrcs ||
+        data.episodePlaySrcs ||
+        data.playSrcs ||
+        data.episodes ||
+        {}
+
+    if (Array.isArray(srcs)) {
+        const item =
+            srcs[parseInt(ep) - 1] ||
+            srcs[0]
+
+        if (typeof item === 'string') {
+            play = item
+        } else if (item) {
+            play =
+                item.url ||
+                item.src ||
+                item.playUrl ||
+                item.videoSrc ||
+                ''
+        }
+    } else if (typeof srcs === 'object') {
+        const item = srcs[ep] || srcs[String(ep)]
+
+        if (typeof item === 'string') {
+            play = item
+        } else if (item) {
+            play =
+                item.url ||
+                item.src ||
+                item.playUrl ||
+                item.videoSrc ||
+                ''
+        }
+    }
+
+    // 兼容直接字段
+    if (!play) {
+        play =
+            data.videoSrc ||
+            data.videoUrl ||
+            data.playUrl ||
+            data.m3u8 ||
+            data.url ||
+            ''
+    }
+
+    // 递归兼容 data 嵌套
+    if (!play && data.data) {
+        play = findPlayUrl(data.data, ep)
+    }
+
+    if (!play) return ''
+
+    play = decodeText(play)
+
+    // 从字符串中提取 URL
+    const urlM = play.match(/https?:\/\/[^\s"'<>]+/i)
+
+    return urlM ? urlM[0] : ''
+}
+
+async function getPlayinfo(ext) {
+    ext = argsify(ext)
+
+    const url = ext.url || ''
+    const ep = String(ext.ep || '1')
+
+    if (!url) return jsonify({ urls: [] })
+
+    try {
+        const html = await fetchHtml(url, SITE + '/')
+
+        const data = findVideoJson(html)
+        let play = findPlayUrl(data, ep)
+
+        // 兜底：直接从页面中查找 m3u8
+        if (!play) {
+            const m3u8M = html.match(
+                /https?:\/\/[^"'\\\s<>]+\.m3u8(?:\?[^"'\\\s<>]*)?/i
+            )
+
+            if (m3u8M) {
+                play = decodeText(m3u8M[0])
+            }
+        }
+
+        if (!play) {
+            console.error('getPlayinfo: play url not found')
+            return jsonify({ urls: [] })
+        }
+
+        return jsonify({
+            urls: [play],
+            headers: [
+                {
+                    'User-Agent': UA,
+                    'Referer': SITE + '/',
+                },
+            ],
+        })
+    } catch (e) {
+        console.error('getPlayinfo error:', e)
+        return jsonify({ urls: [] })
+    }
+}
+
+// ============================================================
+// 搜索
+// ============================================================
+
+async function search(ext) {
+    ext = argsify(ext)
+
+    const kw = String(ext.text || ext.wd || '').trim()
+
+    if (!kw) {
+        return jsonify({
+            list: [],
+            page: 1,
+        })
+    }
+
+    try {
+        const url =
+            SITE +
+            '/search/video/' +
+            encodeURIComponent(kw) +
+            '/'
+
+        const html = await fetchHtml(url, SITE + '/')
+        const list = parseGridCards(html, false)
+
+        return jsonify({
+            list: list,
+            page: 1,
+        })
+    } catch (e) {
+        console.error('search error:', e)
+
+        return jsonify({
+            list: [],
+            page: 1,
+        })
+    }
+}
